@@ -1,24 +1,30 @@
-import json
-import re
-import psutil
-import os
-import time
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import List, Dict, Tuple
-import tiktoken
-import pymupdf4llm
+# Standard Library Imports
+import json       # For reading/writing JSON files (saving the tree/manifest)
+import re         # Regular expressions for text processing (finding headers)
+import psutil     # For monitoring system memory usage to prevent crashes
+import os         # Operating system interfaces (finding file paths)
+import time       # For tracking how long operations take
 
-from langchain_ollama import ChatOllama
-from pydantic import BaseModel, Field
-from langchain_text_splitters import MarkdownHeaderTextSplitter
-from rich.console import Console
-from rich.panel import Panel
-from rich.syntax import Syntax
-from rich.tree import Tree as RichTree
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
+# Data Structure Helpers
+from dataclasses import dataclass, field  # Easy class definitions for the Tree
+from pathlib import Path                  # Object-oriented filesystem paths
+from typing import List, Dict, Tuple      # Type hinting for better code clarity
 
-# ── Paths ──────────────────────────────────────────────────────────────
+# External Libraries
+import tiktoken       # OpenAI's tokenizer (used to count tokens accurately)
+import pymupdf4llm    # Converts PDF layers to clean Markdown for LLMs
+
+# AI & UI Libraries
+from langchain_ollama import ChatOllama   # Connects to the local Ollama server
+from pydantic import BaseModel, Field     # Data validation for structured outputs
+from langchain_text_splitters import MarkdownHeaderTextSplitter # Splits MD by headers
+from rich.console import Console          # Pretty printing to terminal
+from rich.panel import Panel              # Boxed text in terminal
+from rich.syntax import Syntax            # Syntax highlighting for JSON
+from rich.tree import Tree as RichTree    # Visual tree structure in terminal
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn # Progress bars
+
+##  ##                                                                                            ##  ##  --  --  Paths  --  --  ##  ##
 BASE_DIR = Path.home() / "docker/APIinterface/Holonet"
 KB_DIR = BASE_DIR / "Knowledgebase_Alpha"
 LIBRARY_DIR = KB_DIR / "Library"
@@ -26,33 +32,33 @@ MD_CACHE_DIR = KB_DIR / "markdown_cache"
 KB_FILE = KB_DIR / "holonet_resources.json"
 MANIFEST_FILE = KB_DIR / "processed_files.json"
 
-# ── Tuning Constants ──────────────────────────────────────────────────
-MAX_NODES_DISPLAY = 5
-MAX_CONTEXT_TOKENS = 4500
-MAX_RETRIEVAL_NODES = 4
-MAX_SUMMARY_TOKENS = 3000
-FALLBACK_CHUNK_TOKENS = 1500          # max tokens per fallback page-chunk
-MIN_HEADER_COUNT = 2                  # fewer headers than this triggers fallback
+##  ##                                                                                            ##  ##  --  --  Tuning Constants  --  --  ##  ##
+MAX_NODES_DISPLAY = 5           # Limit how many nodes we show in the summary
+MAX_CONTEXT_TOKENS = 4500       # Maximum size of text fed to the LLM for answering
+MAX_RETRIEVAL_NODES = 4         # How many chunks to retrieve for an answer
+MAX_SUMMARY_TOKENS = 3000       # Truncate content before summarizing to save time
+FALLBACK_CHUNK_TOKENS = 1500    # If headers are missing, chop into 1500-token blocks
+MIN_HEADER_COUNT = 2            # If a PDF has < 2 headers, assume formatting failed
 
 console = Console()
 KB_DIR.mkdir(parents=True, exist_ok=True)
 LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
 MD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# ── Model ─────────────────────────────────────────────────────────────
+##  ##                                                                                            ##  ##  --  --  Model  --  --  ##  ##
 model = ChatOllama(
-    model="gemma3:1b",
-    temperature=0,
-    num_ctx=6000,
-    seed=24,
-    num_predict=1024,
-    num_thread=12,
-    num_gpu=1,
-    repeat_penalty=1.1,
-    top_k=40,
-    top_p=0.9,
-    mirostat=0,
-    timeout=120,
+    model="gemma3:1b",  # Using a small, fast model for local inference
+    temperature=0,      # temperature=0 makes it factual/deterministic (no creativity)
+    num_ctx=6000,       # Context window size (how much text it holds in memory)
+    seed=24,            # Fixed seed for reproducible results
+    num_predict=1024,   # Max tokens to generate in response
+    num_thread=12,      # CPU threads to use
+    num_gpu=1,          # Offload layers to GPU if available
+    repeat_penalty=1.1, # Discourage repeating the same phrases
+    top_k=40,           # Sampling parameter for diversity
+    top_p=0.9,          # Sampling parameter for probability mass
+    mirostat=0,         # Entropy-based sampling (off here)
+    timeout=120,        # Crash if no response after 120s
 )
 
 tokenizer = tiktoken.get_encoding("cl100k_base")
@@ -69,7 +75,7 @@ def trim_to_token_limit(text: str, max_tokens: int) -> str:
     return tokenizer.decode(tokens[:max_tokens])
 
 
-# ── Tree Data Structure ──────────────────────────────────────────────
+##  ##                                                                                            ##  ##  --  --  Tree Data Structure  --  --  ##  ##
 @dataclass
 class TreeNode:
     title: str
@@ -103,7 +109,7 @@ class TreeSearchResult(BaseModel):
 
 search_model = model.with_structured_output(TreeSearchResult)
 
-# ── Prompts ───────────────────────────────────────────────────────────
+##  ##                                                         ##  ##  --  --  Prompts  --  --  ##  ##
 SUMMARY_PROMPT = """Extract core technical specifications from this section. 
 Identify: Networking protocols such as OSI layers, Security controls, CLI syntax (PowerShell/Bash/Cisco iOS), NIST,
 Hardware IDs, SQL schemas, or UX heuristics.
@@ -134,7 +140,7 @@ Context:
 Answer:"""
 
 
-# ── File-to-Markdown Conversion ──────────────────────────────────────
+##  ##                                                ##  ##  --  --  File-to-Markdown Conversion  --  --  ##  ##
 def convert_file_to_markdown(file_path: Path) -> str | None:
     """Route a file to the appropriate converter based on extension."""
     ext = file_path.suffix.lower()
@@ -224,7 +230,7 @@ def _chunk_by_tokens(text: str, max_tokens: int) -> List[str]:
     return chunks
 
 
-# ── Tree Builder ──────────────────────────────────────────────────────
+##  ##                                                           ##  ##  --  --  Tree Builder  --  --  ##  ##
 def _has_meaningful_content(text: str, min_length: int = 40) -> bool:
     if not text:
         return False
@@ -296,7 +302,7 @@ def summarize_tree(node: TreeNode):
         node.summary = f"[Summary unavailable: {node.title}]"
 
 
-# ── Node Map & Context ───────────────────────────────────────────────
+##  ##                                                             ##  ##  --  --  Node Map & Context  --  --  ##  ##
 def create_node_map(node: TreeNode) -> Dict[str, TreeNode]:
     m = {node.node_id: node}
     for c in node.nodes:
@@ -324,7 +330,7 @@ def build_context(node_map: Dict[str, TreeNode], node_ids: List[str]) -> str:
     return "\n\n".join(context_parts)
 
 
-# ── Retrieval & Answer ───────────────────────────────────────────────
+##  ##                                                           ##  ##  --  --  Retrieval & Answer  --  --  ##  ##
 def retrieve_and_answer(tree: TreeNode, query: str):
     process = psutil.Process(os.getpid())
     mem_mb = process.memory_info().rss / (1024 * 1024)
@@ -343,7 +349,7 @@ def retrieve_and_answer(tree: TreeNode, query: str):
     return answer, search_res.node_list, search_res.thinking
 
 
-# ── Serialization ────────────────────────────────────────────────────
+##  ##                                                           ##  ##  --  --  Serialization  --  --  ##  ##
 def save_tree(tree: TreeNode, path: Path):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(tree.to_dict(), f, indent=2, ensure_ascii=False)
@@ -367,7 +373,7 @@ def _dict_to_node(d: dict) -> TreeNode:
     return n
 
 
-# ── Manifest (tracks processed PDFs) ─────────────────────────────────
+##  ##                                                  ##  ##  --  --  Manifest (tracks processed PDFs)  --  --  ##  ##
 def load_manifest() -> Dict[str, float]:
     """Returns {filename: mtime} for already-processed PDFs."""
     if MANIFEST_FILE.exists():
@@ -381,7 +387,7 @@ def save_manifest(manifest: Dict[str, float]):
         json.dump(manifest, f, indent=2)
 
 
-# ── Library Scanner & Ingestion Pipeline ──────────────────────────────
+##  ##                                                      ##  ##  --  --  Library Scanner & Ingestion Pipeline  --  --  ##  ##
 def scan_and_ingest_library() -> TreeNode | None:
     """Scan Library/ for PDFs and TXT files, convert → build tree → summarize. Returns merged root."""
     supported_files = sorted(
@@ -464,7 +470,7 @@ def _max_node_id(node: TreeNode) -> int:
     return max_id
 
 
-# ── Display ───────────────────────────────────────────────────────────
+##  ##                                                               ##  ##  --  --  Display  --  --  ##  ##
 def display_tree(node: TreeNode, parent: RichTree | None = None, depth: int = 0) -> RichTree:
     """Render tree using rich, with depth limiting for readability."""
     label = f"[bold]{node.title}[/bold] [dim]({node.node_id})[/dim]"
@@ -491,7 +497,7 @@ if __name__ == "__main__":
         border_style="bright_cyan",
     ))
 
-    # ── Phase 1: Load or Build ────────────────────────────────────────
+    ##  ##                                                 ##  ##  --  --  Phase 1: Load or Build  --  --  ##  ##
     tree = None
 
     if KB_FILE.exists():
@@ -509,7 +515,7 @@ if __name__ == "__main__":
         console.print("[red]✗ No knowledge tree available. Add PDFs to Knowledgebase_Alpha/Library/ and re-run.[/red]")
         exit(1)
 
-    # ── Phase 2: Display Tree Summary ─────────────────────────────────
+    ##  ##                                               ##  ##  --  --  Phase 2: Display Tree Summary  --  --  ##  ##
     node_map = create_node_map(tree)
 
     sample = {
@@ -528,7 +534,7 @@ if __name__ == "__main__":
     console.print(display_tree(tree))
     console.print("\n" + "─" * 80 + "\n")
 
-    # ── Phase 3: Query Loop ───────────────────────────────────────────
+    ##  ##                                                  ##  ##  --  --  Phase 3: Query Loop  --  --  ##  ##
     queries = [
         "Describe 5 built-in exceptions to use in Python code",
         "Describe Red Teaming Solution Framework for Generative AI",
