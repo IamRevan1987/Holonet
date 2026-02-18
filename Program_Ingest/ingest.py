@@ -584,12 +584,16 @@ if __name__ == "__main__":
     ##  ##                                                 ##  ##  --  --  Phase 1: Load or Build  --  --  ##  ##
     tree = None
 
+    # Step A: Load existing tree if available
+    # This saves time so we don't re-digest 1000 PDFs every run.
     if KB_FILE.exists():
         console.print("[bold cyan]Loading existing knowledge tree…[/bold cyan]")
         tree = load_tree(KB_FILE)
         console.print(f"[green]✔ Loaded tree: {tree.node_count()} nodes[/green]\n")
 
-    # Always scan for new/modified PDFs regardless of existing tree
+    # Step B: Scan for new files
+    # Unlike a static database, we check the Library/ folder every time.
+    # If we find new PDFs, we convert/chunk/summarize them and merge them in.
     console.print("[bold cyan]Scanning Library/ for new PDFs…[/bold cyan]")
     updated_tree = scan_and_ingest_library()
     if updated_tree is not None:
@@ -600,6 +604,7 @@ if __name__ == "__main__":
         exit(1)
 
     ##  ##                                               ##  ##  --  --  Phase 2: Display Tree Summary  --  --  ##  ##
+    # We show a JSON dump of the first few nodes so the user can verify the structure
     node_map = create_node_map(tree)
 
     sample = {
@@ -609,6 +614,7 @@ if __name__ == "__main__":
             "content_length": len(node.content),
             "children": len(node.nodes),
         }
+        # Only show the first MAX_NODES_DISPLAY nodes to keep the screen clean
         for nid, node in list(node_map.items())[:MAX_NODES_DISPLAY]
     }
 
@@ -619,11 +625,12 @@ if __name__ == "__main__":
     console.print("\n" + "─" * 80 + "\n")
 
     ##  ##                                                  ##  ##  --  --  Phase 3: Query Loop  --  --  ##  ##
+    # Test queries to verify the system works end-to-end
     queries = [
         "Describe 5 built-in exceptions to use in Python code",
         "Describe Red Teaming Solution Framework for Generative AI",
         "List the import modules used for automating cybersecurity tasks",
-        "Unknown query test: What is the weather in Tatooine?",  # grounding check
+        "Unknown query test: What is the weather in Tatooine?",  # Should trigger "unable to answer"
     ]
 
     console.print(Panel(
