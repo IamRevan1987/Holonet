@@ -1,0 +1,48 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+init/
+
+# Generated knowledge base artifacts
+Knowledgebase_Alpha/holonet_resources.json
+Knowledgebase_Alpha/processed_files.json
+Knowledgebase_Alpha/markdown_cache/
+/Knowledgebase_Alpha/Library/01 Coursera_Foundations of Cybersecurity.pdf
+/Knowledgebase_Alpha/Library/02 Coursera_Manage Security Risks.pdf
+/Knowledgebase_Alpha/Library/03 Coursera_Networks & Network Security.pdf
+/Knowledgebase_Alpha/Library/04 Coursera_Networks & Network Security.pdf
+/Knowledgebase_Alpha/Library/05 Coursera_Assets, Threats, and Vulnerabilities.pdf
+/Knowledgebase_Alpha/Library/06 Coursera_Detection and Response.pdf
+/Knowledgebase_Alpha/Library/07 Coursera_Automate Cybersecurity Tasks with Python.pdf
+/Knowledgebase_Alpha/Library/Cisco_Ethical Hacker.pdf
+/Knowledgebase_Alpha/Library/Cisco_Introduction to Cyber Security.pdf
+/Knowledgebase_Alpha/Library/Cisco_NetworkingBasics.pdf
+/Knowledgebase_Alpha/Library/DStacey-Resume.pdf
+/Knowledgebase_Alpha/Library/Google_Introduction to dnsmasq.pdf
+/Knowledgebase_Alpha/Library/Google_IT Support Fundamentals.pdf
+/Knowledgebase_Alpha/Library/Google_ITNetworkingBasics.pdf
+/Knowledgebase_Alpha/Library/Google_ITSecurity.pdf
+/Knowledgebase_Alpha/Library/Google_LinuxOSNotes.pdf
+/Knowledgebase_Alpha/Library/Google_MobileDeviceNotes.pdf
+/Knowledgebase_Alpha/Library/Google_System Administration and IT Infrastructure Services.pdf
+/Knowledgebase_Alpha/Library/Google_WindowsOSNotes.pdf
+/Knowledgebase_Alpha/Library/NIST Digital Identity Guidelines.pdf
+/Knowledgebase_Alpha/Library/NIST Risk Management Framework.pdf
+/Knowledgebase_Alpha/Library/NIST SP 800-30 Rev1.pdf
+/Knowledgebase_Alpha/Library/NIST_SP_800-61r3_ReadVox_Master.txt
+/Knowledgebase_Alpha/Library/OWASP GenAI Security Project – Solutions Reference Guide.pdf
+/Knowledgebase_Alpha/Library/OWASP Securing MCPs.pdf
+/Knowledgebase_Alpha/Library/OWASP Top 10 for Agentic Applications for 2026.pdf
+/Knowledgebase_Alpha/Library/PerScholas_CompTIA Core 1 Notes.pdf
+/Knowledgebase_Alpha/Library/PerScholas_CompTIA Core 2 Notes.pdf
+/Knowledgebase_Alpha/Library/Python Essentials 1.pdf
+/Knowledgebase_Alpha/Library/Python Essentials 2.pdf
+/Knowledgebase_Alpha/Library/SQL_Reference.pdf
+/Knowledgebase_Alpha/Library/ThinkPython.pdf
