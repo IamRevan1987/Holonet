@@ -78,14 +78,19 @@ def trim_to_token_limit(text: str, max_tokens: int) -> str:
 ##  ##                                                                                            ##  ##  --  --  Tree Data Structure  --  --  ##  ##
 @dataclass
 class TreeNode:
-    title: str
-    node_id: str
-    content: str
-    summary: str = ""
-    source_file: str = ""
-    nodes: List["TreeNode"] = field(default_factory=list)
+    """
+    Represents a single section or header in the document.
+    Think of this like a folder in a file system, but for text.
+    """
+    title: str                  # The header text (e.g., "1. Introduction")
+    node_id: str                # Unique ID (e.g., "0001") for tracking
+    content: str                # The text content directly under this header
+    summary: str = ""           # LLM-generated summary of this section + children
+    source_file: str = ""       # Name of the PDF this came from
+    nodes: List["TreeNode"] = field(default_factory=list)  # Child subsections
 
     def to_dict(self, include_content: bool = True) -> dict:
+        """Convert the tree to a dictionary (JSON-ready format)."""
         result = {
             "title": self.title,
             "node_id": self.node_id,
@@ -99,17 +104,25 @@ class TreeNode:
         return result
 
     def node_count(self) -> int:
+        """Recursively count how many nodes (sections) are in this branch."""
         return 1 + sum(c.node_count() for c in self.nodes)
 
 
 class TreeSearchResult(BaseModel):
+    """
+    Structured output for the LLM when searching the tree.
+    It forces the LLM to return a list of IDs, not just chatty text.
+    """
     thinking: str = Field(description="Reasoning about which nodes are relevant")
     node_list: List[str] = Field(description="List of relevant node IDs")
 
 
+# Create a specialized model that ONLY outputs this JSON structure
 search_model = model.with_structured_output(TreeSearchResult)
 
 ##  ##                                                         ##  ##  --  --  Prompts  --  --  ##  ##
+# Prompt 1: Summarize a section
+# We ask the LLM to extract "hard" technical details, not just fluff.
 SUMMARY_PROMPT = """Extract core technical specifications from this section. 
 Identify: Networking protocols such as OSI layers, Security controls, CLI syntax (PowerShell/Bash/Cisco iOS), NIST,
 Hardware IDs, SQL schemas, or UX heuristics.
@@ -118,6 +131,8 @@ Section: {title}
 
 {content}"""
 
+# Prompt 2: Search the tree
+# We give the LLM the tree skeleton (titles/summaries only) and ask it to pick relevant advice.
 TREE_SEARCH_PROMPT = """You are a Senior Systems Architect. Analyze the document tree to locate 
 specific technical context for the query. 
 Route based on domain: Networking, OS, Security, or Dev.
@@ -127,6 +142,8 @@ Question: {query}
 Document tree structure:
 {tree_index}"""
 
+# Prompt 3: Final Answer
+# We give the LLM the *actual content* of the selected nodes and ask it to answer the user.
 ANSWER_PROMPT = """Act as a Tier 3 Engineer. Answer using the context provided following IT SOP standards.
 1. Lead with CLI commands or configuration snippets if available.
 2. Specify OS/Hardware dependencies and relevant standards.
@@ -142,24 +159,33 @@ Answer:"""
 
 ##  ##                                                ##  ##  --  --  File-to-Markdown Conversion  --  --  ##  ##
 def convert_file_to_markdown(file_path: Path) -> str | None:
-    """Route a file to the appropriate converter based on extension."""
+    """
+    Route a file to the appropriate converter based on extension.
+    Currently supports PDF (via pymupdf4llm) and TXT.
+    Returns the markdown string or None if conversion failed.
+    """
     ext = file_path.suffix.lower()
     if ext == ".pdf":
         return _convert_pdf(file_path)
     elif ext == ".txt":
         return _convert_txt(file_path)
     else:
+        # We skip unsupported files to avoid crashing the loop
         console.print(f"[yellow]⚠ Unsupported file type: {file_path.name} — skipping[/yellow]")
         return None
 
 
 def _convert_pdf(pdf_path: Path) -> str | None:
-    """Convert a PDF to Markdown using pymupdf4llm (+ pymupdf_layout if installed)."""
+    """
+    Convert a PDF to Markdown using pymupdf4llm.
+    This library preserves layout better than basic text extraction.
+    """
     try:
         md_text = pymupdf4llm.to_markdown(str(pdf_path))
     except Exception as e:
         console.print(f"[red]✗ Failed to convert {pdf_path.name}: {e}[/red]")
         return None
+    # Validate the quality of the markdown before returning
     return _validate_and_chunk(md_text, pdf_path)
 
 
@@ -174,11 +200,16 @@ def _convert_txt(txt_path: Path) -> str | None:
 
 
 def _validate_and_chunk(md_text: str, source_path: Path) -> str | None:
-    """Check content quality and apply fallback chunking if headers are sparse."""
+    """
+    Check content quality.
+    CRITICAL: If the PDF text extraction worked but lost all the headers (common in some PDFs), 
+    we need to artificially insert headers so the tree builder doesn't make one giant node.
+    """
     if not md_text or len(md_text.strip()) < 50:
         console.print(f"[yellow]⚠ {source_path.name} produced empty/trivial content — skipping[/yellow]")
         return None
 
+    # Count how many markdown headers (#, ##, ###) exist
     header_count = len(re.findall(r"^#{1,3}\s+\S", md_text, re.MULTILINE))
 
     if header_count < MIN_HEADER_COUNT:
@@ -186,20 +217,21 @@ def _validate_and_chunk(md_text: str, source_path: Path) -> str | None:
             f"[yellow]⚠ {source_path.name}: only {header_count} header(s) detected — "
             f"applying page-boundary fallback chunker[/yellow]"
         )
+        # If headers are missing, chop it by page numbers instead
         md_text = _apply_fallback_chunking(md_text, source_path.stem)
 
     return md_text
 
 
 def _apply_fallback_chunking(md_text: str, doc_name: str) -> str:
-    """Insert ## Page N headers when the PDF produced no/few markdown headers.
-
-    Splits on pymupdf4llm page-break markers (-----) or fixed token windows.
     """
-    # pymupdf4llm inserts horizontal rules between pages
+    Insert ## Page N headers when the PDF produced no/few markdown headers.
+    This ensures we still get a usable tree structure (by page) instead of a blob.
+    """
+    # pymupdf4llm inserts horizontal rules (-----) between pages
     pages = re.split(r"\n-{3,}\n", md_text)
     if len(pages) <= 1:
-        # No page-break markers — fall back to token-window chunking
+        # No page-break markers? Chunk by fixed token count (e.g. every 1500 tokens)
         pages = _chunk_by_tokens(md_text, FALLBACK_CHUNK_TOKENS)
 
     chunked_parts = [f"# {doc_name}\n"]
@@ -207,6 +239,7 @@ def _apply_fallback_chunking(md_text: str, doc_name: str) -> str:
         page = page.strip()
         if not page:
             continue
+        # Artificial header: ## Page 1, ## Page 2, etc.
         chunked_parts.append(f"## Page {i}\n\n{page}\n")
 
     return "\n".join(chunked_parts)
@@ -240,25 +273,40 @@ def _has_meaningful_content(text: str, min_length: int = 40) -> bool:
 
 
 def build_tree(markdown: str, doc_title: str = "Document", start_id: int = 1) -> Tuple[TreeNode, int]:
-    """Build a hierarchical tree from markdown. Returns (root, next_available_id)."""
+    """
+    Build a hierarchical tree from markdown text.
+    Uses a stack-based parsing approach to handle nested #, ##, ### headers.
+    Returns (root_node, next_available_id).
+    """
+    # Split the text by headers using LangChain's splitter
     splitter = MarkdownHeaderTextSplitter(
         headers_to_split_on=[("#", "title"), ("##", "section"), ("###", "subsection")],
         strip_headers=False,
     )
     sections = splitter.split_text(markdown)
+    
+    # Create the document root
     root = TreeNode(title=doc_title, node_id=f"{start_id - 1:04d}", content="", source_file=doc_title)
     counter = start_id
+    
+    # Stack keeps track of [level, node]. Root is level 0.
+    # Level mapping: title (#) -> 1, section (##) -> 2, subsection (###) -> 3
     stack: List[Tuple[int, TreeNode]] = [(0, root)]
     levels = {"title": 1, "section": 2, "subsection": 3}
 
     for section in sections:
         level, title = 0, "General"
+        # Determine the indentation level based on metadata
         for key, val in levels.items():
             if key in section.metadata:
                 level, title = val, section.metadata[key]
+                
+        # Content without a header goes to the root/current parent
         if level == 0:
             root.content += section.page_content
             continue
+            
+        # Create a new node for this section
         node = TreeNode(
             title=title,
             node_id=f"{counter:04d}",
@@ -266,22 +314,37 @@ def build_tree(markdown: str, doc_title: str = "Document", start_id: int = 1) ->
             source_file=doc_title,
         )
         counter += 1
+        
+        # Pop the stack until we find the parent (a node with lower level)
+        # e.g., if we are level 3, we pop until we find level 2 or 1
         while len(stack) > 1 and stack[-1][0] >= level:
             stack.pop()
+            
+        # Add this node as a child of the current top of stack
         stack[-1][1].nodes.append(node)
+        # Push this node so it can be a parent to future deeper nodes
         stack.append((level, node))
 
     return root, counter
 
 
 def summarize_tree(node: TreeNode):
-    """Generate LLM summaries bottom-up: leaf nodes first, then parents."""
+    """
+    Generate LLM summaries bottom-up: leaf nodes first, then parents.
+    Why bottom-up? Because a parent's summary should reflect its children's content.
+    """
+    # 1. Recursively summarize children first
     for child in node.nodes:
         summarize_tree(child)
+    
+    # Check if there's anything to summarize
     has_content = _has_meaningful_content(node.content)
     has_child_summaries = any(c.summary for c in node.nodes)
     if not has_content and not has_child_summaries:
         return
+
+    # 2. Prepare text for the LLM
+    # If we have children, we include their summaries in the context for the parent
     if has_child_summaries:
         children_text = "\n".join(
             f"- {c.title}: {c.summary}" for c in node.nodes if c.summary
@@ -291,7 +354,10 @@ def summarize_tree(node: TreeNode):
             if has_content else children_text
         )
     else:
+        # Leaf node: just summarize its own content
         text = node.content
+        
+    # 3. Truncate and Invoke LLM
     trimmed = trim_to_token_limit(text, MAX_SUMMARY_TOKENS)
     try:
         node.summary = model.invoke(
@@ -332,20 +398,36 @@ def build_context(node_map: Dict[str, TreeNode], node_ids: List[str]) -> str:
 
 ##  ##                                                           ##  ##  --  --  Retrieval & Answer  --  --  ##  ##
 def retrieve_and_answer(tree: TreeNode, query: str):
+    """
+    The core RAG function.
+    1. Search the tree (using titles/summaries) to find relevant node IDs.
+    2. Fetch the full content of those nodes.
+    3. Feed that content + query to the LLM to generate an answer.
+    """
+    # Safety Check: Prevent OOM (Out Of Memory) crashes
     process = psutil.Process(os.getpid())
     mem_mb = process.memory_info().rss / (1024 * 1024)
     if mem_mb > 10000:
         raise MemoryError("Process exceeded 10GB RAM safety threshold")
 
+    # Step 1: Flatten the tree for search
     node_map = create_node_map(tree)
+    # We strip content from the index to make it small enough for the context window
     tree_index = json.dumps(tree.to_dict(False))
+    
+    # Step 2: Ask LLM which nodes look relevant
     search_res = search_model.invoke(
         TREE_SEARCH_PROMPT.format(query=query, tree_index=tree_index)
     )
+    
+    # Step 3: Build big context string from the selected nodes
     context = build_context(node_map, search_res.node_list)
+    
+    # Step 4: Generate final answer
     answer = model.invoke(
         ANSWER_PROMPT.format(query=query, context=context)
     ).content.strip()
+    
     return answer, search_res.node_list, search_res.thinking
 
 
@@ -397,6 +479,7 @@ def scan_and_ingest_library() -> TreeNode | None:
         console.print("[yellow]⚠ No supported files (PDF/TXT) found in Library/ — nothing to ingest.[/yellow]")
         return None
 
+    # Load the manifest to skip files we've already processed
     manifest = load_manifest()
     new_files = []
     for fpath in supported_files:
@@ -412,7 +495,7 @@ def scan_and_ingest_library() -> TreeNode | None:
 
     console.print(f"\n[bold cyan]Found {len(new_files)} new/modified file(s) to ingest[/bold cyan]\n")
 
-    # If we have an existing tree, load it so we can merge
+    # If we have an existing tree, load it so we can merge new stuff into it
     if KB_FILE.exists():
         master_root = load_tree(KB_FILE)
         next_id = _max_node_id(master_root) + 1
@@ -420,6 +503,7 @@ def scan_and_ingest_library() -> TreeNode | None:
         master_root = TreeNode(title="Holonet Root", node_id="0000", content="")
         next_id = 1
 
+    # Process each new file
     for file_path, mtime in new_files:
         console.print(Panel(f"[bold]{file_path.name}[/bold]", border_style="cyan"))
         t0 = time.time()
@@ -430,12 +514,12 @@ def scan_and_ingest_library() -> TreeNode | None:
         if md_text is None:
             continue
 
-        # Cache the markdown
+        # Cache the markdown (handy for debugging)
         md_cache_path = MD_CACHE_DIR / f"{file_path.stem}.md"
         md_cache_path.write_text(md_text, encoding="utf-8")
         console.print(f"  [dim]  ↳ Cached markdown → {md_cache_path.name} ({len(md_text):,} chars)[/dim]")
 
-        # Step 2: Build tree
+        # Step 2: Build tree (local tree for this specific document)
         console.print("  [cyan]Step 2:[/cyan] Building tree index…")
         doc_tree, next_id = build_tree(md_text, doc_title=file_path.stem, start_id=next_id)
         node_count = doc_tree.node_count()
@@ -447,14 +531,14 @@ def scan_and_ingest_library() -> TreeNode | None:
         elapsed = time.time() - t0
         console.print(f"  [green]✔ {file_path.name} ingested in {elapsed:.1f}s[/green]\n")
 
-        # Merge into master root
+        # Merge local document tree into the master knowledge base
         master_root.nodes.append(doc_tree)
 
-        # Update manifest immediately (so partial runs don't redo completed files)
+        # Update manifest immediately (so partially successful runs are saved)
         manifest[file_path.name] = mtime
         save_manifest(manifest)
 
-    # Save the merged tree
+    # Save the final merged tree to disk
     save_tree(master_root, KB_FILE)
     return master_root
 
