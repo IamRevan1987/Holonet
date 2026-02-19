@@ -147,8 +147,8 @@ Document tree structure:
 ANSWER_PROMPT = """Act as a Tier 3 Engineer. Answer using the context provided following IT SOP standards.
 1. Lead with CLI commands or configuration snippets if available.
 2. Specify OS/Hardware dependencies and relevant standards.
-3. If the context is insufficient, state:
-'It appears there was some difficulty obtaining the content you requested.'
+3. Provide source reference information to the best of your knowledge.
+4. Tell the user about similar references and/or reference materials.
 Question: {query}
 
 Context:
