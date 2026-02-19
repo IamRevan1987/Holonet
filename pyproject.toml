@@ -5,6 +5,7 @@ description = "Vectorless RAG engine using tree-indexed retrieval with LLM summa
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "fastapi>=0.129.0",
     "langchain>=1.2.10",
     "langchain-ollama>=1.0.1",
     "langchain-text-splitters>=1.1.0",
@@ -14,4 +15,5 @@ dependencies = [
     "pymupdf4llm>=0.3.4",
     "rich>=14.3.2",
     "tiktoken>=0.12.0",
+    "uvicorn>=0.41.0",
 ]

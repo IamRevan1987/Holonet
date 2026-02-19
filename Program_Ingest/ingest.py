@@ -6,9 +6,22 @@ import os         # Operating system interfaces (finding file paths)
 import time       # For tracking how long operations take
 
 # Data Structure Helpers
-from dataclasses import dataclass, field  # Easy class definitions for the Tree
-from pathlib import Path                  # Object-oriented filesystem paths
-from typing import List, Dict, Tuple      # Type hinting for better code clarity
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import List, Dict, Tuple
+
+# Shared Imports
+from Program_Ingest.shared import (
+    TreeNode, 
+    KB_DIR, 
+    LIBRARY_DIR, 
+    MD_CACHE_DIR, 
+    KB_FILE, 
+    MANIFEST_FILE, 
+    load_tree, 
+    create_node_map,
+    _dict_to_node
+)
 
 # External Libraries
 import tiktoken       # OpenAI's tokenizer (used to count tokens accurately)
@@ -24,14 +37,6 @@ from rich.panel import Panel              # Boxed text in terminal
 from rich.syntax import Syntax            # Syntax highlighting for JSON
 from rich.tree import Tree as RichTree    # Visual tree structure in terminal
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn # Progress bars
-
-##  ##                                                                                            ##  ##  --  --  Paths  --  --  ##  ##
-BASE_DIR = Path.home() / "docker/APIinterface/Holonet"
-KB_DIR = BASE_DIR / "Knowledgebase_Alpha"
-LIBRARY_DIR = KB_DIR / "Library"
-MD_CACHE_DIR = KB_DIR / "markdown_cache"
-KB_FILE = KB_DIR / "holonet_resources.json"
-MANIFEST_FILE = KB_DIR / "processed_files.json"
 
 ##  ##                                                                                            ##  ##  --  --  Tuning Constants  --  --  ##  ##
 MAX_NODES_DISPLAY = 5           # Limit how many nodes we show in the summary
@@ -49,23 +54,30 @@ LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
 MD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 ##  ##                                                                                            ##  ##  --  --  Model  --  --  ##  ##
-model = ChatOllama(
-    model="gemma3:1b",  # Using a small, fast model for local inference
-    temperature=0,      # temperature=0 makes it factual/deterministic (no creativity)
-    num_ctx=6000,       # Context window size (how much text it holds in memory)
-    seed=24,            # Fixed seed for reproducible results
-    num_predict=1024,   # Max tokens to generate in response
-    num_thread=12,      # CPU threads to use
-    num_gpu=1,          # Offload layers to GPU if available
-    repeat_penalty=1.1, # Discourage repeating the same phrases
-    top_k=40,           # Sampling parameter for diversity
-    top_p=0.9,          # Sampling parameter for probability mass
-    mirostat=0,         # Entropy-based sampling (off here)
-    timeout=120,        # Crash if no response after 120s
-)
-
+# Initialize global variables for models - strictly lazy
+model = None
+search_model = None
 tokenizer = tiktoken.get_encoding("cl100k_base")
 
+def setup_models():
+    """Initialize models only when needed (e.g. running ingestion standalone)."""
+    global model, search_model
+    console.print("[cyan]Initializing Ingestion Models (Gemma 3)...[/cyan]")
+    model = ChatOllama(
+        model="gemma3:1b",
+        temperature=0,
+        num_ctx=6000,
+        seed=24,
+        num_predict=1024,
+        num_thread=12,
+        num_gpu=1,
+        repeat_penalty=1.1,
+        top_k=40,
+        top_p=0.9,
+        mirostat=0,
+        timeout=120,
+    )
+    search_model = model.with_structured_output(TreeSearchResult)
 
 def count_tokens(text: str) -> int:
     return len(tokenizer.encode(text))
@@ -77,40 +89,6 @@ def trim_to_token_limit(text: str, max_tokens: int) -> str:
         return text
     return tokenizer.decode(tokens[:max_tokens])
 
-
-##  ##                                                                                            ##  ##  --  --  Tree Data Structure  --  --  ##  ##
-@dataclass
-class TreeNode:
-    """
-    Represents a single section or header in the document.
-    Think of this like a folder in a file system, but for text.
-    """
-    title: str                  # The header text (e.g., "1. Introduction")
-    node_id: str                # Unique ID (e.g., "0001") for tracking
-    content: str                # The text content directly under this header
-    summary: str = ""           # LLM-generated summary of this section + children
-    source_file: str = ""       # Name of the PDF this came from
-    domain: str = ""            # Detected domain label (Networking, Security, OS, Dev, General)
-    nodes: List["TreeNode"] = field(default_factory=list)  # Child subsections
-
-    def to_dict(self, include_content: bool = True) -> dict:
-        """Convert the tree to a dictionary (JSON-ready format)."""
-        result = {
-            "title": self.title,
-            "node_id": self.node_id,
-            "summary": self.summary,
-            "source_file": self.source_file,
-            "domain": self.domain,
-        }
-        if include_content:
-            result["content"] = self.content
-        if self.nodes:
-            result["nodes"] = [n.to_dict(include_content) for n in self.nodes]
-        return result
-
-    def node_count(self) -> int:
-        """Recursively count how many nodes (sections) are in this branch."""
-        return 1 + sum(c.node_count() for c in self.nodes)
 
 
 class TreeSearchResult(BaseModel):
@@ -492,7 +470,7 @@ def build_context(node_map: Dict[str, TreeNode], node_ids: List[str]) -> str:
 
 
 ##  ##                                                           ##  ##  --  --  Retrieval & Answer  --  --  ##  ##
-def retrieve_and_answer(tree: TreeNode, query: str):
+def retrieve_and_answer(tree: TreeNode, query: str, max_nodes: int | None = None):
     """
     The core RAG function.
     1. Search the tree (using titles/summaries) to find relevant node IDs.
@@ -515,15 +493,17 @@ def retrieve_and_answer(tree: TreeNode, query: str):
         TREE_SEARCH_PROMPT.format(query=query, tree_index=tree_index)
     )
     
+    node_ids = search_res.node_list[:max_nodes] if max_nodes else search_res.node_list
+
     # Step 3: Build big context string from the selected nodes
-    context = build_context(node_map, search_res.node_list)
+    context = build_context(node_map, node_ids)
     
     # Step 4: Generate final answer
     answer = model.invoke(
         ANSWER_PROMPT.format(query=query, context=context)
     ).content.strip()
     
-    return answer, search_res.node_list, search_res.thinking
+    return answer, node_ids, search_res.thinking
 
 
 ##  ##                                                           ##  ##  --  --  Serialization  --  --  ##  ##
@@ -533,22 +513,8 @@ def save_tree(tree: TreeNode, path: Path):
     console.print(f"[green]✔ Saved tree → {path.name}[/green]")
 
 
-def load_tree(path: Path) -> TreeNode:
-    with open(path) as f:
-        return _dict_to_node(json.load(f))
+# load_tree and _dict_to_node imported from shared.py
 
-
-def _dict_to_node(d: dict) -> TreeNode:
-    n = TreeNode(
-        title=d["title"],
-        node_id=d["node_id"],
-        content=d.get("content", ""),
-        summary=d.get("summary", ""),
-        source_file=d.get("source_file", ""),
-        domain=d.get("domain", ""),  # Backward compatible: old trees have no domain
-    )
-    n.nodes = [_dict_to_node(c) for c in d.get("nodes", [])]
-    return n
 
 
 ##  ##                                                  ##  ##  --  --  Manifest (tracks processed PDFs)  --  --  ##  ##
