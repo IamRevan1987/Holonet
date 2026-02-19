@@ -18,6 +18,7 @@ import pymupdf4llm    # Converts PDF layers to clean Markdown for LLMs
 from langchain_ollama import ChatOllama   # Connects to the local Ollama server
 from pydantic import BaseModel, Field     # Data validation for structured outputs
 from langchain_text_splitters import MarkdownHeaderTextSplitter # Splits MD by headers
+from domain_detection import detect_domain_shift  # Phase 1: Domain shift detection
 from rich.console import Console          # Pretty printing to terminal
 from rich.panel import Panel              # Boxed text in terminal
 from rich.syntax import Syntax            # Syntax highlighting for JSON
@@ -39,6 +40,8 @@ MAX_RETRIEVAL_NODES = 4         # How many chunks to retrieve for an answer
 MAX_SUMMARY_TOKENS = 3000       # Truncate content before summarizing to save time
 FALLBACK_CHUNK_TOKENS = 1500    # If headers are missing, chop into 1500-token blocks
 MIN_HEADER_COUNT = 2            # If a PDF has < 2 headers, assume formatting failed
+MIN_DOMAIN_BLOCK_TOKENS = 80    # Minimum tokens for a domain block (prevents over-fragmentation)
+MAX_DOMAIN_BLOCK_TOKENS = 1500  # Maximum tokens per domain subnode
 
 console = Console()
 KB_DIR.mkdir(parents=True, exist_ok=True)
@@ -87,6 +90,7 @@ class TreeNode:
     content: str                # The text content directly under this header
     summary: str = ""           # LLM-generated summary of this section + children
     source_file: str = ""       # Name of the PDF this came from
+    domain: str = ""            # Detected domain label (Networking, Security, OS, Dev, General)
     nodes: List["TreeNode"] = field(default_factory=list)  # Child subsections
 
     def to_dict(self, include_content: bool = True) -> dict:
@@ -96,6 +100,7 @@ class TreeNode:
             "node_id": self.node_id,
             "summary": self.summary,
             "source_file": self.source_file,
+            "domain": self.domain,
         }
         if include_content:
             result["content"] = self.content
@@ -135,7 +140,8 @@ Section: {title}
 # We give the LLM the tree skeleton (titles/summaries only) and ask it to pick relevant advice.
 TREE_SEARCH_PROMPT = """You are a Senior Systems Architect. Analyze the document tree to locate 
 specific technical context for the query. 
-Route based on domain: Networking, OS, Security, or Dev.
+Route based on domain tags: [Networking], [OS], [Security], [Dev], or [General].
+Prefer nodes whose domain tag matches the query's domain.
 Select nodes representing the highest granular technical detail.
 Question: {query}
 
@@ -328,6 +334,95 @@ def build_tree(markdown: str, doc_title: str = "Document", start_id: int = 1) ->
     return root, counter
 
 
+def _apply_domain_splitting(root: TreeNode, counter: int) -> Tuple[TreeNode, int]:
+    """
+    Phase 2: Walk the tree and split leaf nodes by detected domain shifts.
+    If a leaf node's content spans multiple domains, replace it with subnodes
+    (one per domain block), preserving the parent hierarchy.
+    Returns (root, updated_counter).
+    """
+    domain_stats = {"split": 0, "subnodes_created": 0, "single_domain": 0}
+
+    def _walk_and_split(node: TreeNode) -> int:
+        nonlocal counter
+
+        # Process children first (depth-first), collecting new children
+        new_children = []
+        for child in node.nodes:
+            _walk_and_split(child)
+            new_children.append(child)
+        node.nodes = new_children
+
+        # Only split leaf nodes (nodes with content but no children)
+        if node.nodes or not node.content or len(node.content.strip()) < 50:
+            return counter
+
+        # Detect domain shifts in this node's content
+        blocks = detect_domain_shift(node.content)
+
+        # If only one domain block (or zero), assign the label but don't split
+        if len(blocks) <= 1:
+            if blocks:
+                node.domain = blocks[0].domain
+            domain_stats["single_domain"] += 1
+            return counter
+
+        # Multiple domain blocks detected → split into subnodes
+        # Keep the parent node but clear its content (content moves to subnodes)
+        original_content = node.content
+        node.content = ""  # Parent becomes a container
+        node.domain = ""   # Parent has no single domain
+
+        for block in blocks:
+            # Skip blocks that are too small (prevents over-fragmentation)
+            block_tokens = len(block.text.split())  # rough word count
+            if block_tokens < MIN_DOMAIN_BLOCK_TOKENS:
+                # Append tiny blocks back to the parent
+                node.content += block.text + "\n\n"
+                continue
+
+            # Split oversized blocks into smaller chunks (Part 1, Part 2...)
+            if block_tokens > MAX_DOMAIN_BLOCK_TOKENS:
+                chunks = _chunk_by_tokens(block.text, MAX_DOMAIN_BLOCK_TOKENS)
+                for i, chunk in enumerate(chunks, 1):
+                    subnode = TreeNode(
+                        title=f"{node.title} ({block.domain} - Part {i})",
+                        node_id=f"{counter:04d}",
+                        content=chunk,
+                        source_file=node.source_file,
+                        domain=block.domain,
+                    )
+                    counter += 1
+                    node.nodes.append(subnode)
+                    domain_stats["subnodes_created"] += 1
+            else:
+                subnode = TreeNode(
+                    title=f"{node.title} ({block.domain})",
+                    node_id=f"{counter:04d}",
+                    content=block.text,
+                    source_file=node.source_file,
+                    domain=block.domain,
+                )
+                counter += 1
+                node.nodes.append(subnode)
+                domain_stats["subnodes_created"] += 1
+
+        # If we created subnodes, log it
+        if node.nodes:
+            domain_stats["split"] += 1
+
+        return counter
+
+    _walk_and_split(root)
+
+    # Print domain splitting stats
+    console.print(f"  [dim]  ↳ Domain splitting: {domain_stats['split']} nodes split, "
+                  f"{domain_stats['subnodes_created']} subnodes created, "
+                  f"{domain_stats['single_domain']} single-domain nodes[/dim]")
+
+    return root, counter
+
+
 def summarize_tree(node: TreeNode):
     """
     Generate LLM summaries bottom-up: leaf nodes first, then parents.
@@ -450,6 +545,7 @@ def _dict_to_node(d: dict) -> TreeNode:
         content=d.get("content", ""),
         summary=d.get("summary", ""),
         source_file=d.get("source_file", ""),
+        domain=d.get("domain", ""),  # Backward compatible: old trees have no domain
     )
     n.nodes = [_dict_to_node(c) for c in d.get("nodes", [])]
     return n
@@ -522,8 +618,16 @@ def scan_and_ingest_library() -> TreeNode | None:
         # Step 2: Build tree (local tree for this specific document)
         console.print("  [cyan]Step 2:[/cyan] Building tree index…")
         doc_tree, next_id = build_tree(md_text, doc_title=file_path.stem, start_id=next_id)
-        node_count = doc_tree.node_count()
-        console.print(f"  [dim]  ↳ Tree built: {node_count} nodes[/dim]")
+        node_count_before = doc_tree.node_count()
+        console.print(f"  [dim]  ↳ Tree built: {node_count_before} nodes[/dim]")
+
+        # Step 2.5: Domain-aware splitting (Phase 2)
+        console.print("  [cyan]Step 2.5:[/cyan] Running domain shift detection…")
+        doc_tree, next_id = _apply_domain_splitting(doc_tree, next_id)
+        node_count_after = doc_tree.node_count()
+        if node_count_after > node_count_before:
+            console.print(f"  [dim]  ↳ Nodes expanded: {node_count_before} → {node_count_after} "
+                          f"(+{node_count_after - node_count_before} domain subnodes)[/dim]")
 
         # Step 3: Summarize
         console.print("  [cyan]Step 3:[/cyan] Generating node summaries (this takes a while)…")
