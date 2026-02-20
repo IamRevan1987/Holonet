@@ -46,3 +46,5 @@ Knowledgebase_Alpha/markdown_cache/
 /Knowledgebase_Alpha/Library/Python Essentials 2.pdf
 /Knowledgebase_Alpha/Library/SQL_Reference.pdf
 /Knowledgebase_Alpha/Library/ThinkPython.pdf
+Knowledgebase_Alpha/Library/*
+!Knowledgebase_Alpha/.gitkeep
