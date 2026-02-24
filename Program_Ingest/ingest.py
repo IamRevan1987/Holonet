@@ -101,7 +101,7 @@ class TreeSearchResult(BaseModel):
 
 
 # Create a specialized model that ONLY outputs this JSON structure
-search_model = model.with_structured_output(TreeSearchResult)
+# search_model is instantiated when setup_models() is called.
 
 ##  ##                                                         ##  ##  --  --  Prompts  --  --  ##  ##
 # Prompt 1: Summarize a section
@@ -540,6 +540,9 @@ def scan_and_ingest_library() -> TreeNode | None:
     if not supported_files:
         console.print("[yellow]⚠ No supported files (PDF/TXT) found in Library/ — nothing to ingest.[/yellow]")
         return None
+
+    # We need the models active before summarizing, so we initialize them here lazy
+    setup_models()
 
     # Load the manifest to skip files we've already processed
     manifest = load_manifest()
